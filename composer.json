@@ -1,0 +1,32 @@
+{
+  "name": "kseven/web-license-sdk",
+  "version": "1.1.0",
+  "description": "SDK oficial PHP 8.1+ (Composer PSR-4) para Licenciamento Web K'Seven com transporte cifrado ECDH+AES-256-GCM e estado criptografado.",
+  "type": "library",
+  "license": "proprietary",
+  "keywords": [
+    "kseven",
+    "licensing",
+    "php",
+    "wordpress",
+    "aes-256-gcm",
+    "ed25519"
+  ],
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-openssl": "*"
+  },
+  "suggest": {
+    "ext-sodium": "Recomendada para verificação nativa Ed25519 em PHP 8.1-8.3"
+  },
+  "autoload": {
+    "psr-4": {
+      "KSeven\\WebLicense\\": "src/"
+    }
+  },
+  "bin": [
+    "bin/k7web.php"
+  ]
+}
