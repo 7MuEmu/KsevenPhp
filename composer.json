@@ -1,17 +1,30 @@
 {
   "name": "kseven/web-license-sdk",
   "version": "1.1.0",
-  "description": "SDK oficial PHP 8.1+ (Composer PSR-4) para Licenciamento Web K'Seven com transporte cifrado ECDH+AES-256-GCM e estado criptografado.",
+  "description": "SDK oficial PHP 8.1+ (Composer PSR-4) para Licenciamento Web K'Seven com transporte selado ECDH P-256 + AES-256-GCM, verificação Ed25519 e estado local criptografado.",
   "type": "library",
   "license": "proprietary",
+  "homepage": "https://kseven.com.br",
   "keywords": [
     "kseven",
     "licensing",
+    "drm",
     "php",
     "wordpress",
     "aes-256-gcm",
+    "ecdh",
     "ed25519"
   ],
+  "authors": [
+    {
+      "name": "K'Seven",
+      "homepage": "https://kseven.com.br"
+    }
+  ],
+  "support": {
+    "issues": "https://kseven.com.br",
+    "docs": "https://kseven.com.br"
+  },
   "require": {
     "php": ">=8.1",
     "ext-curl": "*",
@@ -19,7 +32,8 @@
     "ext-openssl": "*"
   },
   "suggest": {
-    "ext-sodium": "Recomendada para verificação nativa Ed25519 em PHP 8.1-8.3"
+    "ext-sodium": "Recomendada para assinatura e verificação nativa Ed25519 de alta performance (fallback automático via ext-openssl)",
+    "ext-posix": "Recomendada em ambientes Linux/Unix para vincular o segredo padrão do estado local ao UID do processo (posix_getuid)"
   },
   "autoload": {
     "psr-4": {
@@ -28,5 +42,11 @@
   },
   "bin": [
     "bin/k7web.php"
-  ]
+  ],
+  "config": {
+    "sort-packages": true,
+    "optimize-autoloader": true
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
 }
