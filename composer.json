@@ -1,6 +1,6 @@
 {
   "name": "kseven/web-license-sdk",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "SDK oficial PHP 8.1+ (Composer PSR-4) para Licenciamento Web K'Seven com transporte selado ECDH P-256 + AES-256-GCM, verificação Ed25519 e estado local criptografado.",
   "type": "library",
   "license": "proprietary",

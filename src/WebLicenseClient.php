@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace KSeven\WebLicense;
 
 use KSeven\WebLicense\Crypto\Codec;
+use KSeven\WebLicense\Exception\WebLicenseException;
 use KSeven\WebLicense\Support\Env;
 use KSeven\WebLicense\Storage\EncryptedStateStore;
 use RuntimeException;
@@ -143,6 +144,76 @@ final class WebLicenseClient
     }
 
     /**
+     * Normaliza um host HTTP recebido (por exemplo de `$_SERVER['HTTP_HOST']`), removendo
+     * porta explícita (`localhost:8080` -> `localhost`, `[::1]:8080` -> `::1`) e normalizando caixa.
+     * Não altera entradas contendo esquema, caminho ou userinfo para que entradas malformadas
+     * sejam rejeitadas explicitamente pela API.
+     */
+    public static function normalizeHostInput(string $rawHost): string
+    {
+        $trimmed = strtolower(trim($rawHost));
+        if ($trimmed === '') {
+            return '';
+        }
+        // Mantém entradas com esquema, caminho, query ou userinfo intactas para rejeição explícita
+        if (str_contains($trimmed, '://') || str_contains($trimmed, '/') || str_contains($trimmed, '@') || str_contains($trimmed, '?')) {
+            return $trimmed;
+        }
+        // IPv6 entre colchetes com ou sem porta: [::1] ou [::1]:8080
+        if (preg_match('/^\[([0-9a-f:]+)\](?::\d{1,5})?$/', $trimmed, $m) === 1) {
+            return $m[1];
+        }
+        // Hostname ou IPv4 com porta explícita (um único ':')
+        if (substr_count($trimmed, ':') === 1) {
+            $parts = explode(':', $trimmed, 2);
+            if ($parts[0] !== '' && ctype_digit($parts[1])) {
+                return rtrim($parts[0], '.');
+            }
+        }
+        return rtrim($trimmed, '.');
+    }
+
+    /**
+     * Verifica estritamente se o host corresponde a um ambiente local de desenvolvimento suportado:
+     * `localhost`, `127.0.0.1`, `::1` (ou `[::1]`) ou subdomínio estrito `*.localhost` (RFC 1123).
+     * Rejeita variações ambíguas (ex.: `localhost.evil.com`, `foo.localhost.com`, `127.0.0.2`,
+     * `0.0.0.0`, IPs privados genéricos e entradas com porta/caminho).
+     */
+    public static function isLocalhostDevelopmentHost(string $host): bool
+    {
+        $value = strtolower(trim($host));
+        if ($value === '' || strlen($value) > 253) {
+            return false;
+        }
+        if (str_contains($value, '://') || str_contains($value, '/') || str_contains($value, '@') || str_contains($value, '?') || str_contains($value, '#')) {
+            return false;
+        }
+        if ($value === '[::1]') {
+            $value = '::1';
+        }
+        if ($value === 'localhost' || $value === '127.0.0.1' || $value === '::1') {
+            return true;
+        }
+        if (str_contains($value, ':')) {
+            return false;
+        }
+        if (!str_ends_with($value, '.localhost')) {
+            return false;
+        }
+        $prefix = substr($value, 0, -strlen('.localhost'));
+        if ($prefix === '' || str_starts_with($prefix, '.') || str_ends_with($prefix, '.')) {
+            return false;
+        }
+        $labels = explode('.', $prefix);
+        foreach ($labels as $label) {
+            if (preg_match('/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/', $label) !== 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Cria um desafio de validação de propriedade de domínio (ex.: registro DNS TXT ou arquivo HTTP).
      *
      * @param string $licenseKey Chave de licença associada ao domínio.
@@ -203,10 +274,21 @@ final class WebLicenseClient
      */
     public function install(array $options): array
     {
-        $platform = $options['platform'] ?? $this->platform;
-        $environment = $options['environment'] ?? 'production';
+        $rawDomain = (string) ($options['domain'] ?? '');
+        $domain = self::normalizeHostInput($rawDomain);
+        if ($domain === '') {
+            throw new WebLicenseException('O parâmetro domain é obrigatório para install().', 400, 'INVALID_DOMAIN');
+        }
+
+        $platform = (string) ($options['platform'] ?? $this->platform);
+        $isLocalDevHost = self::isLocalhostDevelopmentHost($domain);
+        $explicitEnv = isset($options['environment']) && trim((string) $options['environment']) !== ''
+            ? trim((string) $options['environment'])
+            : null;
+        $environment = $explicitEnv ?? ($isLocalDevHost ? 'development' : 'production');
+
         $fingerprint = $options['instanceFingerprint'] ?? substr(
-            hash('sha256', gethostname() . ':' . $platform . ':' . $options['domain']),
+            hash('sha256', (gethostname() ?: 'php-host') . ':' . $platform . ':' . $domain),
             0,
             32
         );
@@ -219,7 +301,7 @@ final class WebLicenseClient
 
         $payload = [
             'licenseKey' => $options['licenseKey'],
-            'domain' => $options['domain'],
+            'domain' => $domain,
             'platform' => $platform,
             'appVersion' => $options['appVersion'],
             'environment' => $environment,
@@ -234,21 +316,34 @@ final class WebLicenseClient
             $payload['requireSealedTransport'] = true;
         }
 
+        // A API é a autoridade final: só grava estado local se /activate responder 2xx com credencial válida.
         $res = $this->request('POST', '/activate', $payload);
+        if (empty($res['installationId']) || empty($res['installationCredential'])) {
+            throw new WebLicenseException(
+                'Resposta inválida do servidor durante ativação: credencial da instalação ausente.',
+                502,
+                'INVALID_ACTIVATION_RESPONSE'
+            );
+        }
 
         $publicKeys = $this->fetchPublicKeysMap([], true);
         $now = gmdate('c');
+        $installationType = strtoupper((string) ($res['installationType'] ?? ($isLocalDevHost ? 'DEVELOPMENT' : 'PRODUCTION')));
+        $resolvedEnv = (string) ($res['environment'] ?? ($installationType === 'DEVELOPMENT' ? 'development' : $environment));
+        $allowLocalhostDev = (bool) ($res['allowLocalhostDevelopment'] ?? ($res['entitlement']['allowLocalhostDevelopment'] ?? ($installationType === 'DEVELOPMENT')));
 
         $state = [
             'apiBaseUrl' => $this->apiBaseUrl,
-            'installationId' => $res['installationId'],
-            'installationCredential' => $res['installationCredential'],
+            'installationId' => (string) $res['installationId'],
+            'installationCredential' => (string) $res['installationCredential'],
             'credentialPrefix' => $res['credentialPrefix'] ?? null,
             'credentialVersion' => $res['credentialVersion'] ?? 1,
-            'domain' => $res['domain'],
-            'platform' => $res['platform'],
-            'appVersion' => $res['appVersion'],
-            'environment' => $environment,
+            'domain' => (string) ($res['domain'] ?? $domain),
+            'platform' => (string) ($res['platform'] ?? $platform),
+            'appVersion' => (string) ($res['appVersion'] ?? $options['appVersion']),
+            'environment' => $resolvedEnv,
+            'installationType' => $installationType,
+            'allowLocalhostDevelopment' => $allowLocalhostDev,
             'instanceFingerprint' => $fingerprint,
             'installedAt' => $now,
             'updatedAt' => $now,
@@ -276,6 +371,9 @@ final class WebLicenseClient
             'domain' => $state['domain'],
             'platform' => $state['platform'],
             'appVersion' => $state['appVersion'],
+            'environment' => $state['environment'],
+            'installationType' => $state['installationType'],
+            'allowLocalhostDevelopment' => $state['allowLocalhostDevelopment'],
             'idempotentReplay' => (bool) ($res['idempotentReplay'] ?? false),
             'encryptedTransport' => $this->wireSession !== null,
             'entitlement' => $res['entitlement'] ?? null,
@@ -785,7 +883,7 @@ final class WebLicenseClient
         if ($scheme === 'https') {
             return;
         }
-        if ($scheme === 'http' && $this->allowInsecureLocalHttp && in_array($host, ['127.0.0.1', 'localhost', '::1'], true)) {
+        if ($scheme === 'http' && $this->allowInsecureLocalHttp && self::isLocalhostDevelopmentHost($host)) {
             return;
         }
         throw new RuntimeException("Somente URLs HTTPS são permitidas em produção ({$scheme}://{$host}).");
@@ -931,7 +1029,7 @@ final class WebLicenseClient
         curl_close($ch);
 
         if ($raw === false) {
-            throw new RuntimeException('Erro de comunicação HTTP: ' . $curlErr, 503);
+            throw new WebLicenseException('Erro de comunicação HTTP: ' . $curlErr, 503, 'NETWORK_ERROR');
         }
 
         if ($status === 428 && $session !== null && $retryOnSessionExpired) {
@@ -971,8 +1069,15 @@ final class WebLicenseClient
         }
 
         if ($status < 200 || $status >= 300) {
-            $msg = is_array($decoded) && !empty($decoded['message']) ? (string) $decoded['message'] : "Erro HTTP {$status}";
-            throw new RuntimeException($msg, $status);
+            $msg = is_array($decoded) && !empty($decoded['message'])
+                ? (string) $decoded['message']
+                : "Erro HTTP {$status}";
+            $errorCode = is_array($decoded) && !empty($decoded['code'])
+                ? (string) $decoded['code']
+                : "HTTP_{$status}";
+            $details = is_array($decoded) ? $decoded : [];
+            unset($details['signatureEnvelope']);
+            throw new WebLicenseException($msg, $status, $errorCode, $details);
         }
 
         return is_array($decoded) ? $decoded : [];

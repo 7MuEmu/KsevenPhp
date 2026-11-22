@@ -25,11 +25,13 @@ foreach ($autoloadCandidates as $autoload) {
 // Fallback: carrega manualmente as classes do SDK caso o autoloader do Composer não esteja presente
 if (!$loaded) {
     require_once dirname(__DIR__) . '/src/Support/Env.php';
+    require_once dirname(__DIR__) . '/src/Exception/WebLicenseException.php';
     require_once dirname(__DIR__) . '/src/Crypto/Codec.php';
     require_once dirname(__DIR__) . '/src/Storage/EncryptedStateStore.php';
     require_once dirname(__DIR__) . '/src/WebLicenseClient.php';
 }
 
+use KSeven\WebLicense\Exception\WebLicenseException;
 use KSeven\WebLicense\Support\Env;
 use KSeven\WebLicense\WebLicenseClient;
 
@@ -56,7 +58,7 @@ for ($i = 1; $i < count($args); $i++) {
 if ($command === 'help' || $command === '--help' || $command === '-h') {
     echo json_encode([
         'package' => 'kseven/web-license-sdk',
-        'version' => '1.1.0',
+        'version' => '1.2.0',
         'usage' => 'php bin/k7web.php <install|check-version|update|validate|entitlements|uninstall> [opções]',
         'commands' => [
             'install' => '--api <url> --key <licenseKey> --domain <host> --app-version <semver> [--platform php|wordpress|universal] [--state-file .kseven-web-license.dat] [--state-secret <secret>] [--plain-transport]',
@@ -96,13 +98,15 @@ try {
 
     // Roteia o subcomando para o método correspondente do `WebLicenseClient`
     $out = match ($command) {
-        'install' => $client->install([
+        'install' => $client->install(array_filter([
             'licenseKey' => (string) ($flags['key'] ?? Env::get('K7_WEB_LICENSE_KEY') ?? ''),
             'domain' => (string) ($flags['domain'] ?? Env::get('K7_WEB_DOMAIN') ?? ''),
             'appVersion' => (string) ($flags['app-version'] ?? '1.0.0'),
             'platform' => (string) ($flags['platform'] ?? Env::get('K7_WEB_PLATFORM') ?? 'php'),
-            'environment' => (string) ($flags['env'] ?? Env::get('K7_WEB_ENV') ?? 'production'),
-        ]),
+            'environment' => isset($flags['env']) && is_string($flags['env'])
+                ? $flags['env']
+                : Env::get('K7_WEB_ENV'),
+        ], static fn ($v) => $v !== null)),
         'check-version' => $client->checkVersion(
             (string) ($flags['channel'] ?? 'stable'),
             isset($flags['app-version']) && is_string($flags['app-version']) ? $flags['app-version'] : null
@@ -121,6 +125,15 @@ try {
 
     // Imprime o resultado da operação formatado em JSON na saída padrão (STDOUT)
     echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL;
+} catch (WebLicenseException $e) {
+    fwrite(STDERR, json_encode([
+        'error' => true,
+        'httpStatus' => $e->getHttpStatus(),
+        'errorCode' => $e->getErrorCode(),
+        'message' => $e->getMessage(),
+        'details' => $e->getDetails(),
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . PHP_EOL);
+    exit(1);
 } catch (Throwable $e) {
     // Em caso de falha, escreve o erro estruturado em JSON na saída de erro (STDERR) e encerra com código 1
     fwrite(STDERR, json_encode([
