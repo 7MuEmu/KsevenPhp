@@ -785,4 +785,118 @@ final class Codec
         }
         return $manifest;
     }
+
+    /**
+     * Valida offline o JSON bruto assinado salvo em cache local criptografado, conferindo assinatura Ed25519,
+     * integridade SHA-256, vínculo de instalação/domínio, ausência de REVOKED/SUSPENDED e janela `graceUntil`.
+     *
+     * @param string $rawSignedJson JSON bruto da última resposta assinada (`activate` ou `validate`).
+     * @param array<string, string> $trustedKeys Mapa de chaves públicas Ed25519 confiáveis.
+     * @param string $expectedInstallationId ID esperado da instalação atual.
+     * @param string $expectedDomain Domínio esperado da instalação atual.
+     * @param int|null $nowTs Timestamp Unix atual (opcional, para testes).
+     * @return array{keyId: string, graceUntil: string, entitlement: array<string, mixed>, issuedAt: string}
+     */
+    public static function verifyCachedOfflineEntitlement(
+        string $rawSignedJson,
+        array $trustedKeys,
+        string $expectedInstallationId,
+        string $expectedDomain,
+        ?int $nowTs = null
+    ): array {
+        $now = $nowTs ?? time();
+        $obj = json_decode($rawSignedJson, false);
+        if (!($obj instanceof \stdClass) || !isset($obj->signatureEnvelope) || !($obj->signatureEnvelope instanceof \stdClass)) {
+            throw new RuntimeException('Nenhum comprovante assinado Ed25519 disponível em cache para validação offline.', 403);
+        }
+
+        $env = $obj->signatureEnvelope;
+        $keyId = (string) ($env->keyId ?? '');
+        if (($env->schema ?? '') !== 'k7-web-response-sig-v1' || $keyId === '' || empty($env->signatureBase64)) {
+            throw new RuntimeException('Envelope de assinatura do cache offline inválido.', 403);
+        }
+        if (empty($trustedKeys[$keyId])) {
+            throw new RuntimeException("Chave Ed25519 do cache offline não é confiável (keyId={$keyId}).", 403);
+        }
+        if ((string) ($env->decision ?? '') !== 'ALLOW' || !in_array((int) ($env->httpStatus ?? 0), [200, 201], true)) {
+            throw new RuntimeException('Última resposta em cache não autoriza operação offline.', 403);
+        }
+        if (!empty($env->installationId) && (string) $env->installationId !== $expectedInstallationId) {
+            throw new RuntimeException('Cache offline não corresponde à instalação atual.', 403);
+        }
+        if (!empty($env->domain) && strtolower((string) $env->domain) !== strtolower($expectedDomain)) {
+            throw new RuntimeException('Cache offline não corresponde ao domínio atual.', 403);
+        }
+
+        $unsignedCopy = clone $obj;
+        unset($unsignedCopy->signatureEnvelope);
+        $computedHash = self::sha256CanonicalJson($unsignedCopy);
+        if (!hash_equals((string) ($env->payloadSha256 ?? ''), $computedHash)) {
+            throw new RuntimeException('Integridade SHA-256 do cache offline violada.', 403);
+        }
+
+        $canonical = implode('|', [
+            (string) $env->schema,
+            (string) ($env->protocolVersion ?? ''),
+            $keyId,
+            (string) ($env->keyVersion ?? 1),
+            (string) ($env->rootKeyId ?? ''),
+            (string) ($env->requestId ?? ''),
+            (string) ($env->nonce ?? ''),
+            strtoupper((string) ($env->method ?? '')),
+            (string) ($env->path ?? ''),
+            (string) ($env->timestamp ?? ''),
+            (string) ($env->httpStatus ?? ''),
+            (string) ($env->decision ?? ''),
+            (string) ($env->code ?? ''),
+            (string) ($env->productSlug ?? ''),
+            isset($env->licenseId) && $env->licenseId !== null ? (string) $env->licenseId : '',
+            (string) ($env->installationId ?? ''),
+            (string) ($env->domain ?? ''),
+            (string) ($env->licenseStatus ?? ''),
+            (string) ($env->expiresAt ?? ''),
+            (string) ($env->entitlementHash ?? ''),
+            (string) ($env->payloadSha256 ?? ''),
+        ]);
+
+        if (!self::verifyEd25519Message($canonical, (string) $env->signatureBase64, $trustedKeys[$keyId])) {
+            throw new RuntimeException('Assinatura Ed25519 do comprovante offline inválida.', 403);
+        }
+
+        $decodedArr = json_decode($rawSignedJson, true);
+        $entitlement = is_array($decodedArr['entitlement'] ?? null) ? $decodedArr['entitlement'] : null;
+        if ($entitlement === null) {
+            throw new RuntimeException('Payload de entitlement ausente no cache offline.', 403);
+        }
+
+        $status = strtoupper((string) ($entitlement['licenseStatus'] ?? $env->licenseStatus ?? ''));
+        $hardRevoke = is_array($entitlement['offlineValidation']['hardRevokeStatuses'] ?? null)
+            ? array_map(static fn ($s) => strtoupper((string) $s), $entitlement['offlineValidation']['hardRevokeStatuses'])
+            : ['REVOKED', 'SUSPENDED'];
+        if (in_array($status, $hardRevoke, true) || ($status !== 'ACTIVE' && empty($entitlement['inGracePeriod']))) {
+            throw new RuntimeException("Operação offline bloqueada para licença em status {$status}.", 403);
+        }
+
+        if (isset($entitlement['offlineValidation']['allowed']) && $entitlement['offlineValidation']['allowed'] === false) {
+            throw new RuntimeException('A política desta licença não permite operação offline em carência.', 403);
+        }
+
+        $graceUntil = trim((string) ($entitlement['offlineValidation']['graceUntil'] ?? $entitlement['graceUntil'] ?? ''));
+        $graceTs = $graceUntil !== '' ? strtotime($graceUntil) : false;
+        if ($graceTs === false || $now > $graceTs) {
+            throw new RuntimeException('Período de carência offline expirado. Reconecte à API K’Seven para revalidar.', 403);
+        }
+
+        $issuedTs = strtotime((string) ($env->timestamp ?? ''));
+        if ($issuedTs === false || $issuedTs > $now + 300) {
+            throw new RuntimeException('Relógio local inconsistente com a emissão do comprovante assinado.', 403);
+        }
+
+        return [
+            'keyId' => $keyId,
+            'graceUntil' => $graceUntil,
+            'entitlement' => $entitlement,
+            'issuedAt' => (string) ($env->timestamp ?? ''),
+        ];
+    }
 }

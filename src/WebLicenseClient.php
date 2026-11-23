@@ -222,13 +222,25 @@ final class WebLicenseClient
      * @return array<string, mixed> Dados do desafio gerado, incluindo ID, token esperado e instruções.
      * @throws RuntimeException Em caso de falha de comunicação ou rejeição pela API.
      */
-    public function createDomainChallenge(string $licenseKey, string $domain, string $method = 'DNS_TXT'): array
-    {
-        return $this->request('POST', '/domain-challenges', [
+    public function createDomainChallenge(
+        string $licenseKey,
+        string $domain,
+        string $method = 'DNS_TXT',
+        ?string $environment = null,
+        ?bool $allowSubdomains = null
+    ): array {
+        $payload = [
             'licenseKey' => $licenseKey,
             'domain' => $domain,
             'method' => $method,
-        ]);
+        ];
+        if ($environment !== null && trim($environment) !== '') {
+            $payload['environment'] = strtoupper(trim($environment));
+        }
+        if ($allowSubdomains !== null) {
+            $payload['allowSubdomains'] = $allowSubdomains;
+        }
+        return $this->request('POST', '/domain-challenges', $payload);
     }
 
     /**
@@ -247,30 +259,6 @@ final class WebLicenseClient
 
     /**
      * Ativa uma nova instalação da licença e persiste o estado/credencial cifrado localmente em AES-256-GCM (0600).
-     *
-     * @param array{
-     *   licenseKey: string,
-     *   domain: string,
-     *   appVersion: string,
-     *   platform?: string,
-     *   environment?: string,
-     *   instanceFingerprint?: string,
-     *   idempotencyKey?: string,
-     *   clientPublicKeyPem?: string,
-     *   clientPrivateKeyPem?: string,
-     *   requireSealedTransport?: bool
-     * } $options Parâmetros de ativação da instância.
-     * @return array{
-     *   installed: bool,
-     *   installationId: string,
-     *   domain: string,
-     *   platform: string,
-     *   appVersion: string,
-     *   idempotentReplay: bool,
-     *   encryptedTransport: bool,
-     *   entitlement: mixed
-     * } Resumo da instalação ativada.
-     * @throws RuntimeException Se a ativação for recusada ou não for possível salvar o estado local.
      */
     public function install(array $options): array
     {
@@ -316,8 +304,8 @@ final class WebLicenseClient
             $payload['requireSealedTransport'] = true;
         }
 
-        // A API é a autoridade final: só grava estado local se /activate responder 2xx com credencial válida.
-        $res = $this->request('POST', '/activate', $payload);
+        $rawResponseJson = null;
+        $res = $this->request('POST', '/activate', $payload, null, [], true, null, $rawResponseJson);
         if (empty($res['installationId']) || empty($res['installationCredential'])) {
             throw new WebLicenseException(
                 'Resposta inválida do servidor durante ativação: credencial da instalação ausente.',
@@ -331,6 +319,7 @@ final class WebLicenseClient
         $installationType = strtoupper((string) ($res['installationType'] ?? ($isLocalDevHost ? 'DEVELOPMENT' : 'PRODUCTION')));
         $resolvedEnv = (string) ($res['environment'] ?? ($installationType === 'DEVELOPMENT' ? 'development' : $environment));
         $allowLocalhostDev = (bool) ($res['allowLocalhostDevelopment'] ?? ($res['entitlement']['allowLocalhostDevelopment'] ?? ($installationType === 'DEVELOPMENT')));
+        $graceUntil = $res['entitlement']['offlineValidation']['graceUntil'] ?? ($res['entitlement']['graceUntil'] ?? null);
 
         $state = [
             'apiBaseUrl' => $this->apiBaseUrl,
@@ -347,6 +336,10 @@ final class WebLicenseClient
             'instanceFingerprint' => $fingerprint,
             'installedAt' => $now,
             'updatedAt' => $now,
+            'lastValidatedAt' => $now,
+            'graceUntil' => $graceUntil,
+            'lastSignedEntitlement' => $res['entitlement'] ?? null,
+            'lastSignedValidationRawJson' => !empty($res['signatureEnvelope']) ? $rawResponseJson : null,
             'pinnedPublicKeys' => $publicKeys,
             'protocolVersion' => '1.1',
         ];
@@ -381,33 +374,152 @@ final class WebLicenseClient
     }
 
     /**
-     * Valida online o status atual da licença instalada e atualiza a versão registrada caso informada.
+     * Valida online o status atual da licença instalada e persiste comprovante assinado para operação em carência offline.
      *
      * @param string|null $appVersion Nova versão da aplicação a ser reportada e sincronizada no estado local.
-     * @return array<string, mixed> Resposta de validação da licença (status, permissões e metadados assinados).
-     * @throws RuntimeException Se a instalação não existir localmente ou a licença estiver inválida/expirada.
+     * @param bool $allowOfflineGrace Quando true, cai para validação offline assinada em falhas transitórias de rede/503.
+     * @return array<string, mixed>
      */
-    public function validate(?string $appVersion = null): array
+    public function validate(?string $appVersion = null, bool $allowOfflineGrace = false): array
     {
         $state = $this->requireState();
         $payload = ['domain' => $state['domain']];
         if ($appVersion !== null && $appVersion !== '') {
             $payload['appVersion'] = $appVersion;
         }
-        $res = $this->request('POST', '/validate', $payload, $state['installationCredential'], [], true, $state);
-        if ($appVersion !== null && $appVersion !== '' && $appVersion !== $state['appVersion']) {
-            $state['appVersion'] = $appVersion;
-            $state['updatedAt'] = gmdate('c');
+        try {
+            $rawResponseJson = null;
+            $res = $this->request('POST', '/validate', $payload, $state['installationCredential'], [], true, $state, $rawResponseJson);
+            $now = gmdate('c');
+            if ($appVersion !== null && $appVersion !== '') {
+                $state['appVersion'] = $appVersion;
+            }
+            $state['updatedAt'] = $now;
+            $state['lastValidatedAt'] = $now;
+            $state['graceUntil'] = $res['entitlement']['offlineValidation']['graceUntil']
+                ?? ($res['entitlement']['graceUntil'] ?? ($state['graceUntil'] ?? null));
+            if (isset($res['entitlement']) && is_array($res['entitlement'])) {
+                $state['lastSignedEntitlement'] = $res['entitlement'];
+            }
+            if (!empty($res['signatureEnvelope']) && is_string($rawResponseJson)) {
+                $state['lastSignedValidationRawJson'] = $rawResponseJson;
+            }
+            $state['pinnedPublicKeys'] = array_merge(
+                $state['pinnedPublicKeys'] ?? [],
+                $this->discoveredTrustedKeys,
+                $this->pinnedPublicKeys
+            );
             $this->stateStore->write($state);
+            return $res;
+        } catch (WebLicenseException $e) {
+            $isTransient = $e->getErrorCode() === 'NETWORK_ERROR'
+                || in_array($e->getHttpStatus(), [502, 503, 504], true);
+            if ($allowOfflineGrace && $isTransient) {
+                return $this->validateOffline();
+            }
+            throw $e;
         }
+    }
+
+    /**
+     * Valida offline o último comprovante Ed25519 assinado armazenado no estado cifrado,
+     * bloqueando imediatamente se expirado, adulterado ou em status REVOKED/SUSPENDED.
+     *
+     * @return array<string, mixed>
+     */
+    public function validateOffline(?int $nowTs = null): array
+    {
+        $state = $this->requireState();
+        $rawSigned = (string) ($state['lastSignedValidationRawJson'] ?? '');
+        if ($rawSigned === '') {
+            throw new WebLicenseException(
+                'Nenhum comprovante assinado disponível para validação offline.',
+                403,
+                'OFFLINE_CACHE_MISSING'
+            );
+        }
+        $trustedKeys = array_merge(
+            $state['pinnedPublicKeys'] ?? [],
+            $this->discoveredTrustedKeys,
+            $this->pinnedPublicKeys
+        );
+        try {
+            $verified = Codec::verifyCachedOfflineEntitlement(
+                $rawSigned,
+                $trustedKeys,
+                (string) $state['installationId'],
+                (string) $state['domain'],
+                $nowTs
+            );
+        } catch (RuntimeException $e) {
+            throw new WebLicenseException($e->getMessage(), 403, 'OFFLINE_VALIDATION_FAILED');
+        }
+
+        return [
+            'valid' => true,
+            'offline' => true,
+            'inGracePeriod' => true,
+            'graceUntil' => $verified['graceUntil'],
+            'lastValidatedAt' => $state['lastValidatedAt'] ?? $verified['issuedAt'],
+            'installationId' => $state['installationId'],
+            'domain' => $state['domain'],
+            'entitlement' => $verified['entitlement'],
+            'signatureKeyId' => $verified['keyId'],
+        ];
+    }
+
+    /**
+     * Transfere o slot da instalação atual para outro domínio verificado da mesma licença sem nova compra.
+     *
+     * @param array{
+     *   toDomain: string,
+     *   reason?: string,
+     *   immediateActivate?: bool,
+     *   platform?: string,
+     *   appVersion?: string,
+     *   instanceFingerprint?: string,
+     *   clientPublicKeyPem?: string,
+     *   requireSealedTransport?: bool
+     * } $options
+     * @return array<string, mixed>
+     */
+    public function transferInstallation(array $options): array
+    {
+        $state = $this->requireState();
+        $payload = ['toDomain' => self::normalizeHostInput((string) ($options['toDomain'] ?? ''))];
+        foreach (['reason', 'immediateActivate', 'platform', 'appVersion', 'instanceFingerprint', 'clientPublicKeyPem', 'requireSealedTransport'] as $k) {
+            if (array_key_exists($k, $options) && $options[$k] !== null) {
+                $payload[$k] = $options[$k];
+            }
+        }
+        $rawResponseJson = null;
+        $res = $this->request('POST', '/installations/transfer', $payload, $state['installationCredential'], [], true, $state, $rawResponseJson);
+        $now = gmdate('c');
+
+        if (empty($res['pendingReview']) && !empty($res['newInstallation']['installationCredential'])) {
+            $newInst = $res['newInstallation'];
+            $state['installationId'] = (string) $newInst['installationId'];
+            $state['installationCredential'] = (string) $newInst['installationCredential'];
+            $state['credentialPrefix'] = $newInst['credentialPrefix'] ?? null;
+            $state['credentialVersion'] = $newInst['credentialVersion'] ?? 1;
+            $state['domain'] = (string) ($newInst['domain'] ?? $payload['toDomain']);
+            $state['appVersion'] = (string) ($newInst['appVersion'] ?? $state['appVersion']);
+            $state['updatedAt'] = $now;
+            $state['lastValidatedAt'] = $now;
+            $state['graceUntil'] = $res['entitlement']['offlineValidation']['graceUntil']
+                ?? ($res['entitlement']['graceUntil'] ?? null);
+            $state['lastSignedEntitlement'] = $res['entitlement'] ?? null;
+            $state['lastSignedValidationRawJson'] = !empty($res['signatureEnvelope']) ? $rawResponseJson : null;
+            $this->stateStore->write($state);
+        } elseif (empty($res['pendingReview']) && !empty($res['sourceRevoked'])) {
+            $this->stateStore->write(null);
+        }
+
         return $res;
     }
 
     /**
      * Consulta os direitos, recursos e limites (entitlements) liberados para a licença ativa.
-     *
-     * @return array<string, mixed> Mapa de permissões e quotas vinculadas à instalação.
-     * @throws RuntimeException Se não houver instalação local ou ocorrer erro na consulta.
      */
     public function entitlements(): array
     {
@@ -417,11 +529,6 @@ final class WebLicenseClient
 
     /**
      * Adquire um lease (bloqueio temporário de uso/concorrência) para a instalação atual.
-     *
-     * @param int $ttlSeconds Tempo de vida do lease em segundos (padrão: 180).
-     * @param string|null $idempotencyKey Chave opcional para garantir idempotência na aquisição.
-     * @return array<string, mixed> Dados do lease adquirido, incluindo `leaseId`, `leaseToken` e expiração.
-     * @throws RuntimeException Se o limite de sessões simultâneas for atingido ou a requisição falhar.
      */
     public function acquireLease(int $ttlSeconds = 180, ?string $idempotencyKey = null): array
     {
@@ -435,11 +542,6 @@ final class WebLicenseClient
 
     /**
      * Renova o tempo de expiração (heartbeat) de um lease ativo.
-     *
-     * @param string $leaseId Identificador do lease a ser renovado.
-     * @param string|null $leaseToken Token de controle do lease, quando exigido pelo servidor.
-     * @return array<string, mixed> Estado atualizado do lease renovado.
-     * @throws RuntimeException Se o lease já tiver expirado ou for inválido.
      */
     public function heartbeatLease(string $leaseId, ?string $leaseToken = null): array
     {
@@ -458,10 +560,6 @@ final class WebLicenseClient
 
     /**
      * Libera explicitamente um lease ativo antes da expiração do seu TTL.
-     *
-     * @param string $leaseId Identificador do lease a ser encerrado.
-     * @return array<string, mixed> Confirmação da liberação do lease.
-     * @throws RuntimeException Se a instalação não estiver ativa ou ocorrer falha na API.
      */
     public function releaseLease(string $leaseId): array
     {
@@ -478,27 +576,49 @@ final class WebLicenseClient
     }
 
     /**
-     * Verifica se há uma nova versão disponível no canal especificado e valida a assinatura Ed25519 do manifesto.
-     *
-     * @param string $channel Canal de atualização ("stable" ou "beta").
-     * @param string|null $currentVersion Versão atual para comparação (usa a versão do estado local se omitida).
-     * @return array{
-     *   updateAvailable: bool,
-     *   channel: string,
-     *   currentVersion: string,
-     *   latestRelease: array<string, mixed>|null,
-     *   signatureVerified: bool
-     * } Informações da verificação e metadados da release mais recente.
-     * @throws RuntimeException Se a chave pública Ed25519 estiver ausente ou a assinatura/hash do manifesto divergir.
+     * Lista releases compatíveis e versões disponíveis para rollback na licença instalada.
      */
-    public function checkVersion(string $channel = 'stable', ?string $currentVersion = null): array
-    {
+    public function listCompatibleReleases(
+        string $channel = 'stable',
+        ?string $currentVersion = null,
+        ?string $releaseKind = null
+    ): array {
+        $state = $this->requireState();
+        $params = [
+            'channel' => $channel === 'beta' ? 'beta' : 'stable',
+            'currentVersion' => $currentVersion ?: $state['appVersion'],
+        ];
+        if ($releaseKind !== null && trim($releaseKind) !== '') {
+            $params['releaseKind'] = strtoupper(trim($releaseKind));
+        }
+        return $this->request(
+            'GET',
+            '/updates/releases?' . http_build_query($params),
+            null,
+            $state['installationCredential'],
+            [],
+            true,
+            $state
+        );
+    }
+
+    /**
+     * Verifica se há uma nova versão disponível no canal especificado e valida a assinatura Ed25519 do manifesto.
+     */
+    public function checkVersion(
+        string $channel = 'stable',
+        ?string $currentVersion = null,
+        ?string $releaseKind = null
+    ): array {
         $state = $this->requireState();
         $ch = $channel === 'beta' ? 'beta' : 'stable';
         $ver = $currentVersion ?: $state['appVersion'];
 
-        $query = http_build_query(['channel' => $ch, 'currentVersion' => $ver]);
-        $res = $this->request('GET', '/updates/check?' . $query, null, $state['installationCredential'], [], true, $state);
+        $params = ['channel' => $ch, 'currentVersion' => $ver];
+        if ($releaseKind !== null && trim($releaseKind) !== '') {
+            $params['releaseKind'] = strtoupper(trim($releaseKind));
+        }
+        $res = $this->request('GET', '/updates/check?' . http_build_query($params), null, $state['installationCredential'], [], true, $state);
 
         if (empty($res['latestRelease'])) {
             return [
@@ -506,6 +626,9 @@ final class WebLicenseClient
                 'channel' => $ch,
                 'currentVersion' => $ver,
                 'latestRelease' => null,
+                'availableRollbacks' => is_array($res['availableRollbacks'] ?? null) ? $res['availableRollbacks'] : [],
+                'updatesActive' => $res['updatesActive'] ?? true,
+                'updatesExpiresAt' => $res['updatesExpiresAt'] ?? null,
                 'signatureVerified' => true,
             ];
         }
@@ -543,49 +666,15 @@ final class WebLicenseClient
             'channel' => $ch,
             'currentVersion' => $res['currentVersion'] ?? $ver,
             'latestRelease' => $rel,
+            'availableRollbacks' => is_array($res['availableRollbacks'] ?? null) ? $res['availableRollbacks'] : [],
+            'updatesActive' => $res['updatesActive'] ?? true,
+            'updatesExpiresAt' => $res['updatesExpiresAt'] ?? null,
             'signatureVerified' => true,
         ];
     }
 
-    /**
-     * Executa o fluxo completo de atualização: verifica release, solicita grant de download, valida Ed25519,
-     * baixa o pacote, confere SHA-256/tamanho, salva no destino ou aciona callback e atualiza a versão instalada.
-     *
-     * @param array{
-     *   channel?: string,
-     *   currentVersion?: string,
-     *   destDir?: string,
-     *   downloadFileName?: string,
-     *   onVerifiedPackage?: callable(string, array<string, mixed>): void
-     * } $options Opções de canal, diretório de destino e callback pós-verificação.
-     * @return array{
-     *   updated: bool,
-     *   previousVersion: string,
-     *   currentVersion: string,
-     *   release: array<string, mixed>|null,
-     *   savedFilePath?: string|null,
-     *   verifiedSha256?: string,
-     *   signatureVerified: bool
-     * } Resultado da operação de atualização.
-     * @throws RuntimeException Se a assinatura, o hash SHA-256 ou o tamanho do pacote falharem na verificação.
-     */
-    public function update(array $options = []): array
+    private function downloadAndApplyRelease(array $state, array $rel, array $options, bool $isRollback = false): array
     {
-        $state = $this->requireState();
-        $channel = $options['channel'] ?? 'stable';
-        $check = $this->checkVersion($channel, $options['currentVersion'] ?? null);
-
-        if (empty($check['updateAvailable']) || empty($check['latestRelease'])) {
-            return [
-                'updated' => false,
-                'previousVersion' => $state['appVersion'],
-                'currentVersion' => $state['appVersion'],
-                'release' => $check['latestRelease'] ?? null,
-                'signatureVerified' => true,
-            ];
-        }
-
-        $rel = $check['latestRelease'];
         $grant = $this->request(
             'POST',
             '/updates/' . (int) $rel['releaseId'] . '/download-grants',
@@ -680,19 +769,461 @@ final class WebLicenseClient
             'savedFilePath' => $savedFilePath,
             'verifiedSha256' => $actualSha,
             'signatureVerified' => true,
+            'rollback' => $isRollback,
         ];
     }
 
     /**
-     * Desativa a instalação remotamente no servidor de licenças e remove o arquivo de estado criptografado local.
+     * Executa o fluxo completo de atualização com verificação Ed25519 e SHA-256.
+     */
+    public function update(array $options = []): array
+    {
+        $state = $this->requireState();
+        $channel = $options['channel'] ?? 'stable';
+        $check = $this->checkVersion($channel, $options['currentVersion'] ?? null, $options['releaseKind'] ?? null);
+
+        if (empty($check['updateAvailable']) || empty($check['latestRelease'])) {
+            return [
+                'updated' => false,
+                'previousVersion' => $state['appVersion'],
+                'currentVersion' => $state['appVersion'],
+                'release' => $check['latestRelease'] ?? null,
+                'signatureVerified' => true,
+            ];
+        }
+
+        return $this->downloadAndApplyRelease($state, $check['latestRelease'], $options, false);
+    }
+
+    /**
+     * Reporta progresso e resultado da execução de auto-update ao painel de downloads.
      *
-     * @param string $reason Motivo técnico ou administrativo da desativação.
-     * @return array{
-     *   uninstalled: bool,
-     *   alreadyUninstalled: bool,
-     *   installationId: string|null
-     * } Status da desinstalação.
-     * @throws RuntimeException Se ocorrer falha de rede ou erro HTTP diferente de 401/403 durante a desativação.
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    public function reportAutoUpdateProgress(array $payload): array
+    {
+        $state = $this->requireState();
+        return $this->request(
+            'POST',
+            '/updates/auto-update/report',
+            $payload,
+            $state['installationCredential'],
+            [],
+            true,
+            $state
+        );
+    }
+
+    /**
+     * Executa atualização Web automática e transacional com validação Ed25519 + SHA-256,
+     * backup integral prévio, migrações ordenadas e rollback automático em caso de falha.
+     *
+     * @param array{
+     *   targetDir: string,
+     *   applyPackage: callable,
+     *   migrations?: array<int, array{id: string, run: callable}>,
+     *   channel?: string,
+     *   currentVersion?: string,
+     *   releaseKind?: string,
+     *   preserveNames?: array<int, string>,
+     *   reportProgress?: bool
+     * } $options
+     * @return array<string, mixed>
+     */
+    public function autoUpdate(array $options): array
+    {
+        $state = $this->requireState();
+        $runUid = 'aur_' . bin2hex(random_bytes(10));
+        $channel = ($options['channel'] ?? 'stable') === 'beta' ? 'beta' : 'stable';
+        $previousVersion = (string) ($options['currentVersion'] ?? $state['appVersion']);
+        $reportProgress = ($options['reportProgress'] ?? true) !== false;
+
+        $check = $this->checkVersion($channel, $previousVersion, $options['releaseKind'] ?? null);
+        if (empty($check['updateAvailable']) || empty($check['latestRelease'])) {
+            return [
+                'runUid' => $runUid,
+                'updated' => false,
+                'status' => 'UP_TO_DATE',
+                'previousVersion' => $previousVersion,
+                'currentVersion' => $previousVersion,
+                'targetVersion' => null,
+                'signatureVerified' => true,
+                'sha256Verified' => false,
+                'backupCreated' => false,
+                'rollbackPerformed' => false,
+                'migrationsExecuted' => [],
+                'sanitizedError' => null,
+            ];
+        }
+
+        $rel = $check['latestRelease'];
+        $targetDir = rtrim((string) ($options['targetDir'] ?? ''), '/\\');
+        if ($targetDir === '' || !isset($options['applyPackage']) || !is_callable($options['applyPackage'])) {
+            throw new WebLicenseException('targetDir e applyPackage são obrigatórios em autoUpdate().', 400, 'INVALID_AUTO_UPDATE_OPTIONS');
+        }
+
+        $preserve = array_flip(array_merge(['.env', '.kseven-web-license.dat'], $options['preserveNames'] ?? []));
+        $stagingDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'k7_autoupdate_' . bin2hex(random_bytes(6));
+        $backupDir = $stagingDir . DIRECTORY_SEPARATOR . 'backup';
+        @mkdir($stagingDir, 0750, true);
+
+        $signatureVerified = false;
+        $sha256Verified = false;
+        $backupCreated = false;
+        $rollbackPerformed = false;
+        $migrationsExecuted = [];
+
+        $safeReport = function (array $patch) use ($reportProgress, $runUid, $channel, $previousVersion, $rel): void {
+            if (!$reportProgress) {
+                return;
+            }
+            try {
+                $this->reportAutoUpdateProgress(array_merge([
+                    'runUid' => $runUid,
+                    'releaseId' => (int) ($rel['releaseId'] ?? 0),
+                    'channel' => $channel,
+                    'fromVersion' => $previousVersion,
+                    'toVersion' => (string) ($rel['version'] ?? ''),
+                ], $patch));
+            } catch (\Throwable) {
+                // Reporte best-effort
+            }
+        };
+
+        try {
+            $safeReport(['status' => 'DOWNLOADING', 'progressPercent' => 15, 'currentStep' => 'Baixando pacote verificado em área temporária']);
+
+            $grant = $this->request(
+                'POST',
+                '/updates/' . (int) $rel['releaseId'] . '/download-grants',
+                ['maxDownloads' => 1],
+                $state['installationCredential'],
+                [],
+                true,
+                $state
+            );
+            $consumed = $this->request(
+                'GET',
+                '/updates/download/' . rawurlencode((string) $grant['grantId']),
+                null,
+                null,
+                ['x-download-grant-token: ' . $grant['grantToken']]
+            );
+
+            $safeReport(['status' => 'VERIFYING', 'progressPercent' => 35, 'currentStep' => 'Validando assinatura Ed25519 e SHA-256']);
+            $keysMap = $this->fetchPublicKeysMap($state['pinnedPublicKeys'] ?? [], false);
+            $keyId = (string) ($consumed['signingKeyId'] ?? '');
+            $pem = $this->pinnedPublicKeys[$keyId] ?? $keysMap[$keyId] ?? '';
+            if ($pem === '') {
+                $keysMap = $this->fetchPublicKeysMap($state['pinnedPublicKeys'] ?? [], true);
+                $pem = $this->pinnedPublicKeys[$keyId] ?? $keysMap[$keyId] ?? '';
+            }
+            if ($pem === '' && $this->pinnedRootPublicKeyPem === null) {
+                $pem = (string) ($rel['publicKeyPem'] ?? '');
+            }
+            if ($pem === '') {
+                throw new WebLicenseException("Chave pública Ed25519 ausente para keyId={$keyId}", 403, 'UNKNOWN_SIGNING_KEY');
+            }
+
+            $verifiedManifest = Codec::verifyEd25519Manifest(
+                (string) $consumed['manifestJson'],
+                (string) $consumed['manifestSignature'],
+                $pem
+            );
+            if (($verifiedManifest['version'] ?? '') !== ($rel['version'] ?? '') || ($verifiedManifest['channel'] ?? '') !== $channel) {
+                throw new WebLicenseException('Manifesto diverge de versão/canal autorizados.', 403, 'MANIFEST_METADATA_MISMATCH');
+            }
+            $signatureVerified = true;
+
+            $packageUrl = (string) ($consumed['packageUrl'] ?? '');
+            if (str_starts_with($packageUrl, '/api/')) {
+                $packageUrl = $this->apiBaseUrl . $packageUrl;
+            }
+            $this->assertAllowedUrl($packageUrl);
+
+            $tmpPkg = $stagingDir . DIRECTORY_SEPARATOR . 'package.bin';
+            $this->downloadFile($packageUrl, $tmpPkg);
+            $actualSha = strtolower((string) hash_file('sha256', $tmpPkg));
+            $expectedSha = strtolower((string) ($verifiedManifest['packageSha256'] ?? ''));
+            if (!hash_equals($expectedSha, $actualSha)) {
+                throw new WebLicenseException('SHA-256 do pacote não confere com o manifesto assinado.', 422, 'PACKAGE_SHA256_MISMATCH');
+            }
+            $sha256Verified = true;
+
+            $safeReport([
+                'status' => 'BACKING_UP',
+                'progressPercent' => 55,
+                'currentStep' => 'Criando backup completo antes de aplicar atualização',
+                'signatureVerified' => true,
+                'sha256Verified' => true,
+            ]);
+            if (!is_dir($targetDir)) {
+                mkdir($targetDir, 0750, true);
+            }
+            $this->copyDirSafe($targetDir, $backupDir, $preserve);
+            $backupCreated = true;
+
+            $safeReport([
+                'status' => 'APPLYING',
+                'progressPercent' => 75,
+                'currentStep' => 'Aplicando pacote verificado',
+                'signatureVerified' => true,
+                'sha256Verified' => true,
+                'backupCreated' => true,
+            ]);
+            ($options['applyPackage'])($tmpPkg, $targetDir, $rel, $actualSha);
+
+            $migrations = is_array($options['migrations'] ?? null) ? $options['migrations'] : [];
+            if ($migrations !== []) {
+                $safeReport([
+                    'status' => 'MIGRATING',
+                    'progressPercent' => 88,
+                    'currentStep' => 'Executando migrações declaradas em ordem',
+                    'signatureVerified' => true,
+                    'sha256Verified' => true,
+                    'backupCreated' => true,
+                ]);
+                foreach ($migrations as $mig) {
+                    if (isset($mig['run']) && is_callable($mig['run'])) {
+                        ($mig['run'])($targetDir, $previousVersion, (string) $rel['version']);
+                        $migrationsExecuted[] = (string) ($mig['id'] ?? 'migration');
+                    }
+                }
+            }
+
+            $this->validate((string) $rel['version']);
+            $safeReport([
+                'status' => 'COMPLETED',
+                'progressPercent' => 100,
+                'currentStep' => 'Atualização concluída com integridade verificada',
+                'signatureVerified' => true,
+                'sha256Verified' => true,
+                'backupCreated' => true,
+                'rollbackPerformed' => false,
+                'migrationsExecuted' => $migrationsExecuted,
+            ]);
+
+            return [
+                'runUid' => $runUid,
+                'updated' => true,
+                'status' => 'COMPLETED',
+                'previousVersion' => $previousVersion,
+                'currentVersion' => (string) $rel['version'],
+                'targetVersion' => (string) $rel['version'],
+                'signatureVerified' => true,
+                'sha256Verified' => true,
+                'backupCreated' => true,
+                'rollbackPerformed' => false,
+                'migrationsExecuted' => $migrationsExecuted,
+                'sanitizedError' => null,
+            ];
+        } catch (\Throwable $e) {
+            $errMsg = substr($e->getMessage(), 0, 400);
+            if ($backupCreated) {
+                try {
+                    $this->restoreDirFromBackup($backupDir, $targetDir, $preserve);
+                    $rollbackPerformed = true;
+                } catch (\Throwable) {
+                    $rollbackPerformed = false;
+                }
+            }
+            $terminalStatus = $rollbackPerformed ? 'ROLLED_BACK' : 'FAILED';
+            $safeReport([
+                'status' => $terminalStatus,
+                'progressPercent' => 100,
+                'currentStep' => $rollbackPerformed ? 'Rollback concluído após erro' : 'Atualização abortada antes da aplicação',
+                'signatureVerified' => $signatureVerified,
+                'sha256Verified' => $sha256Verified,
+                'backupCreated' => $backupCreated,
+                'rollbackPerformed' => $rollbackPerformed,
+                'migrationsExecuted' => $migrationsExecuted,
+                'error' => $errMsg,
+            ]);
+            return [
+                'runUid' => $runUid,
+                'updated' => false,
+                'status' => $terminalStatus,
+                'previousVersion' => $previousVersion,
+                'currentVersion' => $previousVersion,
+                'targetVersion' => (string) ($rel['version'] ?? ''),
+                'signatureVerified' => $signatureVerified,
+                'sha256Verified' => $sha256Verified,
+                'backupCreated' => $backupCreated,
+                'rollbackPerformed' => $rollbackPerformed,
+                'migrationsExecuted' => $migrationsExecuted,
+                'sanitizedError' => $errMsg,
+            ];
+        } finally {
+            $this->removeDirRecursive($stagingDir);
+        }
+    }
+
+    private function copyDirSafe(string $src, string $dst, array $excludeNames): void
+    {
+        if (!is_dir($dst)) {
+            mkdir($dst, 0750, true);
+        }
+        $items = @scandir($src);
+        if (!is_array($items)) {
+            return;
+        }
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..' || isset($excludeNames[$item])) {
+                continue;
+            }
+            $srcPath = $src . DIRECTORY_SEPARATOR . $item;
+            $dstPath = $dst . DIRECTORY_SEPARATOR . $item;
+            if (is_link($srcPath)) {
+                continue;
+            }
+            if (is_dir($srcPath)) {
+                $this->copyDirSafe($srcPath, $dstPath, $excludeNames);
+            } elseif (is_file($srcPath)) {
+                copy($srcPath, $dstPath);
+            }
+        }
+    }
+
+    private function restoreDirFromBackup(string $backupDir, string $targetDir, array $preserveNames): void
+    {
+        $items = @scandir($targetDir);
+        if (is_array($items)) {
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..' || isset($preserveNames[$item])) {
+                    continue;
+                }
+                $full = $targetDir . DIRECTORY_SEPARATOR . $item;
+                if (is_dir($full) && !is_link($full)) {
+                    $this->removeDirRecursive($full);
+                } else {
+                    @unlink($full);
+                }
+            }
+        }
+        $this->copyDirSafe($backupDir, $targetDir, $preserveNames);
+    }
+
+    private function removeDirRecursive(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $items = @scandir($dir);
+        if (is_array($items)) {
+            foreach ($items as $item) {
+                if ($item === '.' || $item === '..') {
+                    continue;
+                }
+                $full = $dir . DIRECTORY_SEPARATOR . $item;
+                if (is_dir($full) && !is_link($full)) {
+                    $this->removeDirRecursive($full);
+                } else {
+                    @unlink($full);
+                }
+            }
+        }
+        @rmdir($dir);
+    }
+
+    /**
+     * Realiza rollback verificado (Ed25519 + SHA-256) para uma release anterior compatível e permitida.
+     */
+    public function rollback(int $releaseId, array $options = []): array
+    {
+        $state = $this->requireState();
+        $listed = $this->listCompatibleReleases($options['channel'] ?? 'stable');
+        $candidates = array_merge(
+            is_array($listed['releases'] ?? null) ? $listed['releases'] : [],
+            is_array($listed['availableRollbacks'] ?? null) ? $listed['availableRollbacks'] : []
+        );
+        $target = null;
+        foreach ($candidates as $rel) {
+            if ((int) ($rel['releaseId'] ?? 0) === $releaseId) {
+                $target = $rel;
+                break;
+            }
+        }
+        if ($target === null) {
+            throw new WebLicenseException("Release #{$releaseId} não disponível para rollback.", 404, 'ROLLBACK_RELEASE_NOT_FOUND');
+        }
+        if (array_key_exists('allowRollback', $target) && $target['allowRollback'] === false) {
+            throw new WebLicenseException("Rollback desabilitado para a release #{$releaseId}.", 403, 'ROLLBACK_DISABLED');
+        }
+        return $this->downloadAndApplyRelease($state, $target, $options, true);
+    }
+
+    /**
+     * Helpers autenticados por Bearer JWT do painel para integração da Loja in-app.
+     */
+    private function panelRequest(string $method, string $panelPath, string $jwtToken, ?array $body = null): array
+    {
+        $url = $this->apiBaseUrl . '/api/web' . $panelPath;
+        $this->assertAllowedUrl($url);
+        $headers = [
+            'Accept: application/json',
+            'Authorization: Bearer ' . $jwtToken,
+        ];
+        $postBody = null;
+        if ($body !== null) {
+            $headers[] = 'Content-Type: application/json';
+            $postBody = json_encode($body);
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => $this->timeoutSeconds,
+            CURLOPT_FOLLOWLOCATION => false,
+        ]);
+        if ($postBody !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $postBody);
+        }
+        $raw = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
+        curl_close($ch);
+        if ($raw === false) {
+            throw new WebLicenseException('Erro de rede ao consultar loja web: ' . $curlErr, 503, 'NETWORK_ERROR');
+        }
+        $decoded = json_decode((string) $raw, true);
+        if ($status < 200 || $status >= 300) {
+            $msg = is_array($decoded) && !empty($decoded['message']) ? (string) $decoded['message'] : "Erro HTTP {$status}";
+            $code = is_array($decoded) && !empty($decoded['code']) ? (string) $decoded['code'] : "HTTP_{$status}";
+            throw new WebLicenseException($msg, $status, $code, is_array($decoded) ? $decoded : []);
+        }
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    public function getStoreCatalog(string $jwtToken, ?int $licenseId = null, ?string $productSlug = null): array
+    {
+        $params = [];
+        if ($licenseId !== null) {
+            $params['licenseId'] = $licenseId;
+        }
+        if ($productSlug !== null && $productSlug !== '') {
+            $params['productSlug'] = $productSlug;
+        }
+        $qs = $params !== [] ? ('?' . http_build_query($params)) : '';
+        return $this->panelRequest('GET', '/store/catalog' . $qs, $jwtToken);
+    }
+
+    public function checkStoreCompatibility(string $jwtToken, array $payload): array
+    {
+        return $this->panelRequest('POST', '/store/compatibility-check', $jwtToken, $payload);
+    }
+
+    public function createStoreOrder(string $jwtToken, array $payload): array
+    {
+        if (empty($payload['orderOrigin'])) {
+            $payload['orderOrigin'] = 'IN_APP_STORE';
+        }
+        return $this->panelRequest('POST', '/invoices/checkout', $jwtToken, $payload);
+    }
+
+    /**
+     * Desativa a instalação remotamente no servidor de licenças e remove o arquivo de estado criptografado local.
      */
     public function uninstall(string $reason = 'PHP_SDK_UNINSTALL'): array
     {
@@ -757,7 +1288,11 @@ final class WebLicenseClient
     {
         if ((!$this->useEncryptedTransport && !$this->requireSealedTransport) || !function_exists('openssl_pkey_derive')) {
             if ($this->requireSealedTransport) {
-                throw new RuntimeException('Transporte selado k7seal.v1 obrigatório indisponível (openssl_pkey_derive ausente).', 503);
+                throw new WebLicenseException(
+                    'Transporte selado k7seal.v1 obrigatório indisponível (openssl_pkey_derive ausente).',
+                    503,
+                    'SEALED_TRANSPORT_UNAVAILABLE'
+                );
             }
             return null;
         }
@@ -786,19 +1321,44 @@ final class WebLicenseClient
         ]);
         $raw = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
         curl_close($ch);
 
-        if ($raw === false || $status < 200 || $status >= 300) {
+        if ($raw === false) {
             if ($this->requireSealedTransport) {
-                throw new RuntimeException("Falha ao negociar sessão criptográfica ECDH (HTTP {$status}).", $status ?: 503);
+                throw new WebLicenseException(
+                    'Falha de rede ao negociar sessão criptográfica ECDH: ' . ($curlErr ?: 'erro desconhecido'),
+                    503,
+                    'NETWORK_ERROR'
+                );
             }
             return null;
         }
 
         $data = json_decode((string) $raw, true);
+
+        if ($status < 200 || $status >= 300) {
+            $errCode = is_array($data) && !empty($data['code'])
+                ? (string) $data['code']
+                : ($status === 503 ? 'REDIS_UNAVAILABLE' : 'SEALED_TRANSPORT_UNAVAILABLE');
+            $errMsg = is_array($data) && !empty($data['message'])
+                ? (string) $data['message']
+                : "Falha ao negociar sessão criptográfica ECDH (HTTP {$status}).";
+            $details = is_array($data) ? $data : [];
+            unset($details['signatureEnvelope']);
+            if ($this->requireSealedTransport || $status === 503 || $status === 429 || $status >= 500) {
+                throw new WebLicenseException($errMsg, $status ?: 503, $errCode, $details);
+            }
+            return null;
+        }
+
         if (!is_array($data) || empty($data['sessionId']) || empty($data['serverPublicKeySpkiBase64'])) {
             if ($this->requireSealedTransport) {
-                throw new RuntimeException('Resposta incompleta do servidor em /session-key.', 502);
+                throw new WebLicenseException(
+                    'Resposta incompleta do servidor em /session-key.',
+                    502,
+                    'INVALID_SESSION_KEY_RESPONSE'
+                );
             }
             return null;
         }
@@ -957,7 +1517,7 @@ final class WebLicenseClient
      * @return array<string, mixed> Resposta JSON decodificada e autenticada.
      * @throws RuntimeException Em falha de rede, HTTP >= 400 ou violação de integridade criptográfica.
      */
-    private function request(string $method, string $endpointPath, ?array $body = null, ?string $credential = null, array $extraHeaders = [], bool $retryOnSessionExpired = true, ?array $state = null): array 
+    private function request(string $method, string $endpointPath, ?array $body = null, ?string $credential = null, array $extraHeaders = [], bool $retryOnSessionExpired = true, ?array $state = null, ?string &$rawResponseJson = null): array 
     {
         $url = $this->apiBaseUrl . '/api/web/license/v1' . $endpointPath;
         $this->assertAllowedUrl($url);
@@ -1034,7 +1594,7 @@ final class WebLicenseClient
 
         if ($status === 428 && $session !== null && $retryOnSessionExpired) {
             $this->wireSession = null;
-            return $this->request($method, $endpointPath, $body, $credential, $extraHeaders, false, $state);
+            return $this->request($method, $endpointPath, $body, $credential, $extraHeaders, false, $state, $rawResponseJson);
         }
 
         $plainJson = (string) $raw;
@@ -1051,7 +1611,18 @@ final class WebLicenseClient
 
         if ($this->verifyResponseSignatures && is_array($decoded)) {
             $hasEnv = !empty($decoded['signatureEnvelope']) && is_array($decoded['signatureEnvelope']);
-            if ($hasEnv || $this->pinnedRootPublicKeyPem !== null) {
+            $isUnsignedInfraError =
+                !$hasEnv &&
+                $status >= 400 &&
+                (
+                    $status === 503 ||
+                    $status === 429 ||
+                    $status >= 500 ||
+                    !empty($decoded['code']) ||
+                    ($decoded['success'] ?? null) === false
+                );
+
+            if ($hasEnv || ($this->pinnedRootPublicKeyPem !== null && !$isUnsignedInfraError)) {
                 $trustedKeys = $this->fetchPublicKeysMap($state['pinnedPublicKeys'] ?? [], false);
                 $envKeyId = (string) ($decoded['signatureEnvelope']['keyId'] ?? '');
                 if ($envKeyId !== '' && empty($trustedKeys[$envKeyId])) {
@@ -1080,6 +1651,7 @@ final class WebLicenseClient
             throw new WebLicenseException($msg, $status, $errorCode, $details);
         }
 
+        $rawResponseJson = $plainJson;
         return is_array($decoded) ? $decoded : [];
     }
 

@@ -43,6 +43,12 @@ final class WebLicenseException extends RuntimeException
         return $this->errorCode;
     }
 
+    public function getRequestId(): ?string
+    {
+        $reqId = $this->details['requestId'] ?? null;
+        return is_string($reqId) && $reqId !== '' ? $reqId : null;
+    }
+
     /**
      * @return array<string, mixed>
      */
